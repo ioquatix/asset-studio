@@ -2,3 +2,5 @@
 **.rs.bk
 Cargo.swp
 *.swp
+__pycache__/
+*.pyc

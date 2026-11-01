@@ -66,5 +66,6 @@ The `models` crate declares a catalog of model servers. Each entry maps to a
 Python process (via `uv`) on a fixed port. To run a real model (e.g. the
 TRELLIS.2 paint vertical slice), you need the Python/CUDA environment (see the
 `justfile` / Nix flake in the reference repo) — that is independent of the Rust
-structure. The server boots the model server on demand when a job for it is
-queued.
+structure. The server currently starts catalog orchestrators at boot; use
+`--model-server trellis2` to start just TRELLIS.2 on a single GPU. See the
+[GPU setup and real paint smoke test](docs/trellis2.md) for reproducible commands.

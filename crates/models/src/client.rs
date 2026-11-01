@@ -288,15 +288,31 @@ impl<'scope> ModelClient<'scope> {
         body: Option<&[u8]>,
         cancellation: &Cancellation,
     ) -> Result<HttpResult, CallError> {
-        let request = match body {
-            Some(bytes) => Request::new(method, path, BufferedBody::from(bytes.to_vec())),
-            None => Request::new(method, path, BufferedBody::from(Vec::new())),
-        };
+        let request = model_request(method, path, body);
         let response: Response<ResponseBody> = self.client.call(request, cancellation).await?;
         let status = response.metadata.status;
         let body = read_to_end(response.body, cancellation).await?;
         Ok(HttpResult { status, body })
     }
+}
+
+/// Model endpoints exchange JSON; without an explicit media type FastAPI
+/// can interpret a generation body as bytes instead of a request object.
+fn model_request(method: Method, path: &str, body: Option<&[u8]>) -> Request<BufferedBody<Vec<u8>>> {
+    let mut request = Request::new(
+        method,
+        path,
+        BufferedBody::from(body.unwrap_or_default().to_vec()),
+    );
+    request.fields
+        .add("Accept", "application/json")
+        .expect("static HTTP field");
+    if body.is_some() {
+        request.fields
+            .add("Content-Type", "application/json")
+            .expect("static HTTP field");
+    }
+    request
 }
 
 /// Read a `ResponseBody` to completion, returning all payload bytes.
@@ -318,6 +334,21 @@ async fn read_to_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_requests_declare_json_content_type() {
+        let request = model_request(Method::POST, "/v1/generate", Some(b"{}"));
+        assert_eq!(
+            request.fields.values("content-type").collect::<Vec<_>>(),
+            vec![b"application/json".as_slice()],
+        );
+        assert_eq!(
+            request.fields.values("accept").collect::<Vec<_>>(),
+            vec![b"application/json".as_slice()],
+        );
+        let info = model_request(Method::GET, "/v1/info", None);
+        assert_eq!(info.fields.values("content-type").count(), 0);
+    }
 
     #[test]
     fn decodes_a_generate_response() {
