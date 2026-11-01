@@ -18,6 +18,7 @@
 //! launcher's; the launcher only knows the process state.
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
@@ -30,6 +31,9 @@ pub struct ServerSpec {
     pub program: String,
     /// Arguments to the program.
     pub args: Vec<String>,
+    /// Working directory for the child (e.g. the server's `pyproject` dir, so
+    /// `uv` can resolve the project). `None` inherits the studio's cwd.
+    pub cwd: Option<PathBuf>,
     /// Extra environment variables.
     pub env: Vec<(String, String)>,
     /// Whether this server needs the GPU slot.
@@ -111,6 +115,9 @@ impl Launcher {
 
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args);
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -208,6 +215,7 @@ mod tests {
             id: id.into(),
             program: program.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: None,
             env: vec![],
             uses_gpu,
         }

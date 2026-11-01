@@ -11,4 +11,4 @@ pub mod client;
 pub mod catalog;
 
 pub use catalog::{all_servers, find_server, ModelServer};
-pub use client::ModelClient;
+pub use client::{CallError, GenerateOutput, GenerateResult, ModelClient, ModelError, ServerStatusInfo};
