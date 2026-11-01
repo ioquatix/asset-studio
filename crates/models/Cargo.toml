@@ -1,0 +1,24 @@
+[package]
+name = "asset-studio-models"
+description = "Model-server catalog and typed HTTP client for asset-studio (servers run as separate Python processes)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "asset_studio_models"
+path = "src/lib.rs"
+
+[dependencies]
+asset-studio-core = { path = "../core" }
+asset-studio-launcher = { path = "../launcher" }
+base-scheduler = { workspace = true }
+base-http = { workspace = true }
+base-http-client = { workspace = true }
+base-endpoint = { workspace = true }
+futures-lite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

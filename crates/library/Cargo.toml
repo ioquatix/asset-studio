@@ -1,0 +1,23 @@
+[package]
+name = "asset-studio-library"
+description = "SQLite-backed asset library and blob store for asset-studio."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "asset_studio_library"
+path = "src/lib.rs"
+
+[dependencies]
+asset-studio-core = { path = "../core" }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,17 @@
+[package]
+name = "asset-studio-launcher"
+description = "Model-server process lifecycle (spawn, health, GPU slot) for asset-studio."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "asset_studio_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+asset-studio-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

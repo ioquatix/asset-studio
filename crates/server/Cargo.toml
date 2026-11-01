@@ -1,0 +1,40 @@
+[package]
+name = "asset-studio-server"
+description = "HTTP API + MCP server for asset-studio (base-http-server on base-scheduler)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "asset_studio_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asset-studio-server"
+path = "src/main.rs"
+
+[dependencies]
+asset-studio-core = { path = "../core" }
+asset-studio-library = { path = "../library" }
+asset-studio-launcher = { path = "../launcher" }
+asset-studio-models = { path = "../models" }
+base-scheduler = { workspace = true }
+base-scheduler-native = { workspace = true }
+base-http = { workspace = true }
+base-http1 = { workspace = true }
+base-http-server = { workspace = true }
+base-endpoint = { workspace = true }
+futures-lite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

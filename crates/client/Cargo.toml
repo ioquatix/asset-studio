@@ -1,0 +1,31 @@
+[package]
+name = "asset-studio-client"
+description = "asset-studio CLI: generate, wait, import, list."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "asset_studio_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asset-studio"
+path = "src/main.rs"
+
+[dependencies]
+asset-studio-core = { path = "../core" }
+base-scheduler = { workspace = true }
+base-scheduler-native = { workspace = true }
+base-http = { workspace = true }
+base-http-client = { workspace = true }
+base-endpoint = { workspace = true }
+futures-lite = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
