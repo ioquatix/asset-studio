@@ -1,0 +1,62 @@
+[project]
+name = "asset-studio-model-servers"
+version = "0.1.0"
+description = "asset-studio's own model servers (contract v1): Z-Image text-to-image, TRELLIS.2 image-to-3D."
+license = "MIT"
+# The TRELLIS.2 native wheels (cumesh, flex_gemm, o_voxel, nvdiffrast) are built for cp311.
+requires-python = "==3.11.*"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.7",
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+  "xformers==0.0.32.post2",
+  # DINOv3 (TRELLIS.2 conditioning) and Qwen3 (Z-Image text encoder).
+  "transformers==4.57.3",
+  "diffusers>=0.36,<0.43",
+  "accelerate>=1.0",
+  "huggingface-hub>=0.34,<1",
+  "safetensors>=0.4",
+  "numpy==1.26.4",
+  "scipy>=1.13",
+  "Pillow>=10.4",
+  "opencv-python-headless>=4.10,<4.12",
+  "trimesh>=4.4",
+  "plyfile",
+  "einops>=0.8",
+  "easydict",
+  "zstandard",
+  "imageio",
+  "tqdm",
+  "kornia",
+  "timm",
+  "setuptools>=69",
+  "wheel",
+  "ninja",
+  "pybind11>=2.12",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3", "httpx>=0.27"]
+
+[project.scripts]
+asset-studio-zimage-server = "asset_studio_servers.zimage:main"
+asset-studio-trellis2-server = "asset_studio_servers.trellis2:main"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+xformers = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/asset_studio_servers"]

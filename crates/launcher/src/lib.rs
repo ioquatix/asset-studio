@@ -14,8 +14,9 @@
 //!   [`ProcessWait`](base_scheduler::ProcessWait) and await termination
 //!   asynchronously).
 //!
-//! Readiness (HTTP `GET /health`) is the *orchestrator's* concern, not the
-//! launcher's; the launcher only knows the process state.
+//! Readiness (`GET /v1/info`) is the *orchestrator's* concern, not the
+//! launcher's; the launcher only knows the process state (and, through
+//! [`gpu_free_mib`], how much GPU memory is free before a start).
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -173,8 +174,11 @@ impl Launcher {
         Ok(handle.process.id())
     }
 
-    /// Force-stop a server (SIGKILL), reap it, and free the GPU slot if it
-    /// held one. Returns the exit code, if it was tracked.
+    /// Stop a server and every process it started (the launch wrapper, `uv`,
+    /// the Python server): `SIGTERM` to the whole tree, up to 10 s for the
+    /// server to shut down cleanly, then `SIGKILL` to whatever remains. Reaps
+    /// it and frees the GPU slot if it held one. Returns the exit code, if it
+    /// was tracked.
     pub fn kill(&self, id: &str) -> io::Result<Option<i32>> {
         let mut state = self.state.lock().unwrap();
         let handle = match state.servers.remove(id) {
@@ -183,8 +187,27 @@ impl Launcher {
         };
         let release = handle.uses_gpu;
         let mut process = handle.process;
-        let _ = process.kill();
-        let status = process.wait()?;
+        let tree = process_tree(process.id());
+        signal(&tree, "TERM");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(s) = process.try_wait()? {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Descendants that outlived their parent (or ignored SIGTERM).
+        let survivors: Vec<u32> = tree.into_iter().filter(|pid| alive(*pid)).collect();
+        signal(&survivors, "KILL");
+        let status = match status {
+            Some(s) => s,
+            None => {
+                let _ = process.kill();
+                process.wait()?
+            }
+        };
         if release {
             state.gpu_holders.remove(id);
         }
@@ -198,6 +221,65 @@ impl Launcher {
             let _ = self.kill(&id);
         }
     }
+}
+
+/// `root` and all its descendants (from `/proc/<pid>/task/*/children`), root first.
+fn process_tree(root: u32) -> Vec<u32> {
+    let mut tree = vec![root];
+    let mut index = 0;
+    while index < tree.len() {
+        let pid = tree[index];
+        index += 1;
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                tree.extend(children.split_whitespace().filter_map(|c| c.parse::<u32>().ok()));
+            }
+        }
+    }
+    tree
+}
+
+fn alive(pid: u32) -> bool {
+    // A zombie still has a /proc entry; only count processes that can run.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'))
+        .unwrap_or(false)
+}
+
+fn signal(pids: &[u32], name: &str) {
+    if pids.is_empty() {
+        return;
+    }
+    let _ = Command::new("kill")
+        .arg(format!("-{name}"))
+        .args(pids.iter().map(u32::to_string))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Free memory on the first GPU, in MiB, from `nvidia-smi`; `None` if it
+/// cannot be queried (no NVIDIA driver, or `nvidia-smi` missing), in which
+/// case callers should not block on it.
+pub fn gpu_free_mib() -> Option<u64> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_free_mib(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The first line of `nvidia-smi --query-gpu=memory.free` output, in MiB.
+fn parse_free_mib(text: &str) -> Option<u64> {
+    text.lines().next()?.trim().parse().ok()
 }
 
 impl Drop for Launcher {
@@ -252,6 +334,33 @@ mod tests {
         }
         assert!(l.gpu_is_free());
         assert!(l.server_ids().is_empty());
+    }
+
+    #[test]
+    fn kill_stops_grandchildren_too() {
+        let l = Launcher::new();
+        // A shell that starts a grandchild, as the launch wrapper does.
+        l.spawn(&spec("tree", false, "sh", &["-c", "sleep 30 & wait"])).unwrap();
+        let root = l.process_id("tree").unwrap();
+        let mut tree = vec![];
+        for _ in 0..50 {
+            tree = process_tree(root);
+            if tree.len() > 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(tree.len() > 1, "the grandchild started");
+        l.kill("tree").unwrap();
+        assert!(tree.iter().all(|pid| !alive(*pid)), "no process of the tree survives");
+    }
+
+    #[test]
+    fn parses_nvidia_smi_free_memory() {
+        assert_eq!(parse_free_mib("22625\n"), Some(22625));
+        assert_eq!(parse_free_mib("  812 \n2048\n"), Some(812));
+        assert_eq!(parse_free_mib("[N/A]\n"), None);
+        assert_eq!(parse_free_mib(""), None);
     }
 
     #[test]

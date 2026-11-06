@@ -284,6 +284,7 @@ impl Studio {
                 ))
             }
             ("POST", ["jobs"]) => submit_job(&self.app, raw_body),
+            ("POST", ["pipelines", "text-to-3d"]) => text_to_3d(&self.app, raw_body),
             ("GET", ["jobs", id]) => {
                 let job = self
                     .app
@@ -378,7 +379,77 @@ fn import_asset(
 fn submit_job(app: &Arc<App>, raw: &[u8]) -> Result<Response<BufferedBody<Vec<u8>>>, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|e| ApiError::BadRequest(format!("bad json: {e}")))?;
+    let job = build_job(&req)?;
+    app.library.lock().unwrap().insert_job(&job)?;
+    Ok(Studio::json(
+        Status::CREATED,
+        serde_json::json!({ "job": job }),
+    ))
+}
 
+/// Submit the text-to-3D chain as three dependent jobs:
+///
+/// 1. `zimage` `text-to-image`: the prompt as one object on a plain
+///    background (`object_reference`);
+/// 2. `birefnet` `image-to-image`: its first picture, cut out;
+/// 3. `trellis2_3d` `image-to-3d`: the cut-out as a textured GLB.
+///
+/// Body: `{prompt, seed?, height_m?, image_params?, cutout_params?,
+/// model_params?}`. Each later job takes output 0 of the one before, so the
+/// orchestrators run them in order and hand the GPU along. Returns
+/// `{jobs: [picture, cutout, model], model_job}`; the model job's output is
+/// the GLB.
+fn text_to_3d(app: &Arc<App>, raw: &[u8]) -> Result<Response<BufferedBody<Vec<u8>>>, ApiError> {
+    let req: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|e| ApiError::BadRequest(format!("bad json: {e}")))?;
+    let prompt = req
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("prompt: a non-empty string is required".into()))?;
+    let seeds = req.get("seed").map(|seed| serde_json::json!([seed]));
+    let object = |value: Option<&serde_json::Value>| -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(serde_json::Map::new()),
+            Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+            Some(_) => Err(ApiError::BadRequest("*_params: expected an object".into())),
+        }
+    };
+    let mut image_params = object(req.get("image_params"))?;
+    image_params.entry("object_reference").or_insert(true.into());
+    let mut model_params = object(req.get("model_params"))?;
+    if let Some(height) = req.get("height_m") {
+        model_params.insert("height_m".into(), height.clone());
+    }
+
+    let picture = build_job(&serde_json::json!({
+        "server": "zimage", "task": "text-to-image", "prompt": prompt,
+        "params": image_params, "count": 1, "seeds": seeds,
+    }))?;
+    let cutout = build_job(&serde_json::json!({
+        "server": "birefnet", "task": "image-to-image",
+        "params": object(req.get("cutout_params"))?,
+        "inputs": { "image": { "job": picture.id.0, "output": 0 } },
+    }))?;
+    let model = build_job(&serde_json::json!({
+        "server": "trellis2_3d", "task": "image-to-3d", "params": model_params, "seeds": seeds,
+        "inputs": { "image": { "job": cutout.id.0, "output": 0 } },
+    }))?;
+    {
+        let library = app.library.lock().unwrap();
+        for job in [&picture, &cutout, &model] {
+            library.insert_job(job)?;
+        }
+    }
+    Ok(Studio::json(
+        Status::CREATED,
+        serde_json::json!({ "jobs": [picture, cutout, model], "model_job": model.id }),
+    ))
+}
+
+/// Build (and validate) a queued job from a submit payload.
+fn build_job(req: &serde_json::Value) -> Result<asset_studio_core::Job, ApiError> {
     let server = req.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let task = req.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let prompt = req.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -450,11 +521,10 @@ fn submit_job(app: &Arc<App>, raw: &[u8]) -> Result<Response<BufferedBody<Vec<u8
     };
 
     job.validate_inputs(task_info)?;
-    app.library.lock().unwrap().insert_job(&job)?;
-    Ok(Studio::json(
-        Status::CREATED,
-        serde_json::json!({ "job": job }),
-    ))
+    if task_info.uses_prompt && job.prompt.as_deref().map_or(true, |p| p.trim().is_empty()) {
+        return Err(ApiError::BadRequest(format!("{server}/{task} needs a prompt")));
+    }
+    Ok(job)
 }
 
 /// Cancel a job (only legal while queued/waiting/running).

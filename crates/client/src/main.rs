@@ -106,6 +106,25 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
+    /// Make a textured 3D model from a sentence: Z-Image picture →
+    /// BiRefNet cut-out → TRELLIS.2 GLB, as three dependent jobs.
+    #[command(name = "text-to-3d")]
+    TextTo3d {
+        /// What to make, e.g. "a small mossy rock".
+        prompt: String,
+        /// Seed for the picture and the model (random if omitted).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Scale the model to this height in metres, standing on the ground.
+        #[arg(long)]
+        height: Option<f64>,
+        /// TRELLIS.2 params as a JSON object, e.g. '{"resolution": "512"}'.
+        #[arg(long)]
+        model_params: Option<String>,
+        /// Wait for the model, then write the GLB here.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Poll a job until it reaches a terminal state.
     Wait {
         /// Job id.
@@ -234,6 +253,47 @@ async fn execute(
                 job = serde_json::json!({ "job": final_job });
             }
             Ok(json_value(job))
+        }
+        Command::TextTo3d {
+            prompt,
+            seed,
+            height,
+            model_params,
+            output,
+        } => {
+            let model_params = model_params
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()?;
+            let payload = serde_json::json!({
+                "prompt": prompt, "seed": seed, "height_m": height, "model_params": model_params,
+            });
+            let submitted = client.text_to_3d(&payload, cancellation).await?;
+            let Some(path) = output else {
+                return Ok(json_value(submitted));
+            };
+            let model_job = submitted["model_job"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("no model_job in {submitted}"))?
+                .to_string();
+            // Follow each stage, so a failure names the stage that failed.
+            for job in submitted["jobs"].as_array().into_iter().flatten() {
+                let done = wait_for_job(scheduler, client, job, 1000, cancellation).await?;
+                let stage = format!("{}/{}", done["server"].as_str().unwrap_or("?"), done["task"].as_str().unwrap_or("?"));
+                if done["state"] != "succeeded" {
+                    anyhow::bail!("{stage} {}: {}", done["state"], done["error"]);
+                }
+                eprintln!("{stage} done");
+                if done["id"] == model_job.as_str() {
+                    let asset = done["outputs"][0]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("the model job has no output"))?;
+                    let bytes = client.download(asset, cancellation).await?;
+                    std::fs::write(&path, &bytes)?;
+                    return Ok(format!("wrote {} bytes to {} (asset {asset})", bytes.len(), path.display()));
+                }
+            }
+            anyhow::bail!("the model job was not among the submitted jobs")
         }
         Command::Wait { id, interval_ms } => {
             let job = client.job(&id, cancellation).await?;

@@ -1,5 +1,6 @@
 #!/usr/bin/bash
-# Run inside the reference assets-studio-gpu/assets-studio-cuda Nix shell.
+# Environment for a GPU model server, run inside the reference
+# assets-studio-gpu/assets-studio-cuda Nix shell.
 # Invoke with /usr/bin/bash: the reference shell may put host libc on the
 # library path, which breaks Nix's bash before it can repair the environment.
 set -euo pipefail

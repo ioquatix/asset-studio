@@ -7,22 +7,16 @@
 //! error`). There is no job polling on the model side — one request *is* one
 //! job.
 //!
-//! For a given model server, [`run`](Self::run) does:
+//! Servers run **on demand** (see [`run`]): a server's process starts when
+//! one of its jobs is ready (its dependencies have succeeded) and the GPU
+//! slot and enough GPU memory are free, and stops when it has been idle for
+//! a while, or at once when idle and another GPU server has work. Jobs that
+//! reference another job's output therefore form a pipeline — e.g. prompt →
+//! picture (Z-Image) → cut-out (BiRefNet) → textured GLB (TRELLIS.2) — that
+//! hands the single GPU from one model to the next.
 //!
-//! 1. Starts the model server process (via the [`Launcher`], acquiring the
-//!    GPU slot if it's a GPU server) — or adopts it if it's already running.
-//! 2. Connects a typed [`ModelClient`](asset_studio_models::ModelClient).
-//! 3. Drives the client's driver and a job pump **concurrently**:
-//!    - the pump picks at most one `Queued` job whose dependencies are
-//!      satisfied, waits for the server to report `ready`, runs the
-//!      synchronous `generate`, stores every returned output as a library
-//!      asset, and marks the job `Succeeded`;
-//!    - it reaps the server process; when it exits, the in-flight jobs are
-//!      failed and `run` returns (the caller decides whether to restart).
-//!
-//! The pump and driver run in the *same* async scope (avoiding the
-//! `'static`-task spawn that would hit the scheduler-ownership lifetime
-//! boundary). Pacing uses the scheduler's
+//! Within a session the job loop and the HTTP client's driver run
+//! concurrently in the same async scope. Pacing uses the scheduler's
 //! [`Clock`](base_scheduler::Clock); process reaping uses the launcher's
 //! non-blocking [`poll`](asset_studio_launcher::Launcher::poll).
 use std::collections::BTreeMap;
@@ -74,12 +68,40 @@ impl<S> Scheduler for S where
 {
 }
 
-/// Run the job pump for one model server, starting the server process and
-/// connecting the client, until `cancellation` is observed.
+/// How long a GPU model server stays up with no work before it is stopped
+/// (`ASSET_STUDIO_IDLE_SECONDS`, default 120). It stops sooner, as soon as it
+/// is idle, if another GPU server has a job waiting for the slot.
+fn idle_timeout() -> Duration {
+    let seconds = std::env::var("ASSET_STUDIO_IDLE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    Duration::from_secs(seconds)
+}
+
+/// How long a model may take to report `ready` after starting
+/// (`ASSET_STUDIO_LOAD_SECONDS`, default 900) before its job fails.
+fn load_timeout() -> Duration {
+    let seconds = std::env::var("ASSET_STUDIO_LOAD_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    Duration::from_secs(seconds)
+}
+
+const TICK: Duration = Duration::from_millis(500);
+
+/// Run the orchestrator for one model server until `cancellation`.
 ///
-/// Returns `Ok(())` on clean shutdown (cancellation). A process exit or a
-/// driver failure returns `Err` describing *why* it stopped, so the caller
-/// can decide whether to restart the server.
+/// The server process runs **on demand**: while no job for it is ready the
+/// orchestrator only watches the queue. When one is, it waits for the GPU
+/// slot and for enough free GPU memory, starts the process, connects a
+/// client and runs a *session* that dispatches jobs one at a time. The
+/// session ends when the server has been idle for [`idle_timeout`], or as
+/// soon as it is idle while another GPU server has work waiting (so a
+/// text → picture → cut-out → 3D chain hands the GPU along), or when the
+/// process exits. The process is then stopped and the loop starts over, so
+/// a crashed server is restarted by the next job.
 pub async fn run<S: Scheduler>(
     scheduler: &S,
     app: &Arc<App>,
@@ -88,113 +110,206 @@ pub async fn run<S: Scheduler>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = asset_studio_models::find_server(server_id)
         .ok_or_else(|| format!("unknown server {server_id}"))?;
-    let launcher = &app.launcher;
-
-    // 1. Start the server process (acquires the GPU slot if needed) unless a
-    //    previous run is still alive.
-    if launcher.poll(server_id).unwrap_or(ServerStatus::Off) != ServerStatus::Running {
-        let spec = server.spec();
-        let pid = launcher.spawn(&spec)?;
-        tracing::info!(server = server_id, ?pid, "model server started");
-    } else {
-        tracing::info!(server = server_id, "adopting already-running model server");
-    }
-
-    // 2. Connect the typed client.
     let addr: SocketAddr = format!("127.0.0.1:{}", server.port).parse()?;
-    let (client, driver) = ModelClient::connect(scheduler, addr)?;
+    let mut waiting_for: Option<String> = None;
 
-    // 3. Run the pump and the driver concurrently: whichever finishes first
-    //    wins; the other is dropped.
-    let inner = cancellation.child();
-    let pump_fut = pump(scheduler, app, &client, server_id, &inner);
-    let driver_fut = driver.run(cancellation);
-    let outcome = select2(pump_fut, driver_fut).await;
-
-    // Clean up the process, then report why we stopped.
-    let _ = launcher.kill(server_id);
-
-    match outcome {
-        // Pump finished first.
-        Ok(PumpExit::Cancelled) => {
-            tracing::info!(server = server_id, "model server stopped");
-            Ok(())
+    while !cancellation.is_cancelled() {
+        fail_blocked_jobs(app, server_id);
+        if pick_ready_job(app, server_id).is_none() {
+            waiting_for = None;
+            let _ = scheduler.sleep(TICK, cancellation).await;
+            continue;
         }
-        Ok(PumpExit::ProcessExited(code)) => Err(
-            format!("model server process exited (code {code})").into(),
-        ),
-        Ok(PumpExit::ProcessLost) => Err("model server process state lost".into()),
-        // Driver finished first.
-        Err(Ok(())) => {
-            tracing::info!(server = server_id, "client driver stopped (cancellation)");
-            Ok(())
+
+        match start(app, &server) {
+            Ok(pid) => {
+                waiting_for = None;
+                tracing::info!(server = server_id, pid, "model server started");
+            }
+            Err(Start::Wait(reason)) => {
+                if waiting_for.as_deref() != Some(reason.as_str()) {
+                    tracing::info!(server = server_id, "job waiting: {reason}");
+                    waiting_for = Some(reason);
+                }
+                let _ = scheduler.sleep(TICK, cancellation).await;
+                continue;
+            }
+            Err(Start::Failed(reason)) => {
+                tracing::warn!(server = server_id, "cannot start model server: {reason}");
+                if let Some(job) = pick_ready_job(app, server_id) {
+                    fail_job(app, &job.id, format!("cannot start model server: {reason}"));
+                }
+                continue;
+            }
         }
-        Err(Err(e)) => Err(format!("client driver failed: {e}").into()),
+
+        let (client, driver) = match ModelClient::connect(scheduler, addr) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = app.launcher.kill(server_id);
+                return Err(format!("connecting to {addr}: {e}").into());
+            }
+        };
+        let session_cancellation = cancellation.child();
+        let outcome = select2(
+            session(scheduler, app, &client, &server, &session_cancellation),
+            driver.run(&session_cancellation),
+        )
+        .await;
+        let _ = app.launcher.kill(server_id);
+        match outcome {
+            Ok(SessionEnd::Idle) => tracing::info!(server = server_id, "model server stopped (idle)"),
+            Ok(SessionEnd::Yielded) => {
+                tracing::info!(server = server_id, "model server stopped (GPU handed over)")
+            }
+            Ok(SessionEnd::Cancelled) => {}
+            Ok(SessionEnd::Exited(reason)) => {
+                tracing::warn!(server = server_id, "model server stopped: {reason}")
+            }
+            Err(Ok(())) => {}
+            Err(Err(e)) => tracing::warn!(server = server_id, "client driver failed: {e}"),
+        }
+    }
+    tracing::info!(server = server_id, "orchestrator stopped");
+    Ok(())
+}
+
+/// Why a server could not be started now.
+enum Start {
+    /// Not now: the GPU slot or memory is taken. The job stays queued.
+    Wait(String),
+    /// The process could not be spawned at all.
+    Failed(String),
+}
+
+/// Start `server`'s process: needs the GPU slot and `vram_mib` of free GPU memory.
+fn start(app: &Arc<App>, server: &asset_studio_models::ModelServer) -> Result<u32, Start> {
+    let launcher = &app.launcher;
+    if server.uses_gpu {
+        let holders = launcher.gpu_holders();
+        if !holders.is_empty() {
+            return Err(Start::Wait(format!("the GPU is in use by {}", holders.join(", "))));
+        }
+        if let Some(free) = asset_studio_launcher::gpu_free_mib() {
+            if free < server.vram_mib {
+                return Err(Start::Wait(format!(
+                    "{} MiB of GPU memory free, {} MiB needed (is another program, e.g. Ollama, using the GPU?)",
+                    free, server.vram_mib
+                )));
+            }
+        }
+    }
+    match launcher.spawn(&server.spec()) {
+        Ok(pid) => Ok(pid),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Start::Wait(e.to_string())),
+        Err(e) => Err(Start::Failed(e.to_string())),
     }
 }
 
-/// The terminal outcome of a pump loop (other than external cancellation).
-enum PumpExit {
-    /// The process exited with a status code.
-    ProcessExited(i32),
-    /// The process state was lost.
-    ProcessLost,
-    /// The pump's own cancellation was observed (external shutdown).
+/// Why a session ended.
+enum SessionEnd {
+    /// No work for [`idle_timeout`].
+    Idle,
+    /// Idle while another GPU server had work waiting.
+    Yielded,
+    /// The orchestrator is shutting down.
     Cancelled,
+    /// The process exited or its state was lost.
+    Exited(String),
 }
 
-/// The job pump loop for one server.
-async fn pump<S: Scheduler + ?Sized>(
+/// Dispatch ready jobs to a running server until it should stop.
+async fn session<S: Scheduler + ?Sized>(
     scheduler: &S,
     app: &Arc<App>,
     client: &ModelClient<'_>,
-    server_id: &str,
+    server: &asset_studio_models::ModelServer,
     cancellation: &Cancellation,
-) -> PumpExit {
-    const TICK: Duration = Duration::from_millis(250);
-    let launcher = &app.launcher;
-
+) -> SessionEnd {
+    let server_id = server.id.as_str();
+    let mut idle_since = std::time::Instant::now();
     loop {
         if cancellation.is_cancelled() {
-            return PumpExit::Cancelled;
+            return SessionEnd::Cancelled;
         }
-
-        // Reap the process if it has exited.
-        match launcher.poll(server_id) {
-            Ok(ServerStatus::Exited(code)) => {
-                fail_server_jobs(app, server_id, format!("server process exited (code {code})"));
-                return PumpExit::ProcessExited(code);
-            }
-            Ok(_) => {}
-            Err(_) => {
-                fail_server_jobs(app, server_id, "server process state lost".into());
-                return PumpExit::ProcessLost;
-            }
+        if let Some(reason) = process_gone(app, server_id) {
+            fail_in_flight_jobs(app, server_id, reason.clone());
+            return SessionEnd::Exited(reason);
         }
-
+        fail_blocked_jobs(app, server_id);
         if let Some(job) = pick_ready_job(app, server_id) {
-            dispatch::<S>(scheduler, app, client, &job, cancellation).await;
+            dispatch::<S>(scheduler, app, client, server_id, &job, cancellation).await;
+            idle_since = std::time::Instant::now();
+            continue;
         }
-
+        if server.uses_gpu && other_gpu_server_waiting(app, server_id) {
+            return SessionEnd::Yielded;
+        }
+        if idle_since.elapsed() >= idle_timeout() {
+            return SessionEnd::Idle;
+        }
         let _ = scheduler.sleep(TICK, cancellation).await;
     }
 }
 
-/// The one `Queued` job for `server_id` whose dependencies are all satisfied,
-/// if any (jobs are persisted in creation order, so first is the oldest).
+/// `Some(reason)` if the server's process has exited (reaping it).
+fn process_gone(app: &Arc<App>, server_id: &str) -> Option<String> {
+    match app.launcher.poll(server_id) {
+        Ok(ServerStatus::Exited(code)) => Some(format!("model server process exited (code {code})")),
+        Ok(_) => None,
+        Err(_) => Some("model server process state lost".into()),
+    }
+}
+
+/// Whether another GPU server in the catalog has a job ready to run.
+fn other_gpu_server_waiting(app: &Arc<App>, server_id: &str) -> bool {
+    asset_studio_models::all_servers()
+        .iter()
+        .filter(|s| s.uses_gpu && s.id != server_id)
+        .any(|s| pick_ready_job(app, &s.id).is_some())
+}
+
+/// The oldest `Queued` job for `server_id` whose dependencies have all succeeded.
 fn pick_ready_job(app: &Arc<App>, server_id: &str) -> Option<Job> {
     let lib = app.library.lock().unwrap();
     let (jobs, states) = (lib.list_jobs(None, 512).ok()?, lib.job_states().ok()?);
     let states_map: BTreeMap<JobId, JobState> = states.into_iter().collect();
-    jobs.into_iter()
-        .find(|j| {
-            j.server == server_id
-                && j.state == JobState::Queued
-                && j
-                    .dependencies()
-                    .iter()
-                    .all(|d| states_map.get(&d.job_id) == Some(&JobState::Succeeded))
-        })
+    // `list_jobs` is newest first.
+    jobs.into_iter().rev().find(|j| {
+        j.server == server_id
+            && j.state == JobState::Queued
+            && j
+                .dependencies()
+                .iter()
+                .all(|d| states_map.get(&d.job_id) == Some(&JobState::Succeeded))
+    })
+}
+
+/// Fail queued jobs for `server_id` whose dependency failed, was cancelled
+/// or does not exist: they could never run.
+fn fail_blocked_jobs(app: &Arc<App>, server_id: &str) {
+    let blocked: Vec<(JobId, String)> = {
+        let lib = app.library.lock().unwrap();
+        let (Ok(jobs), Ok(states)) = (lib.list_jobs(Some("queued"), 512), lib.job_states()) else {
+            return;
+        };
+        let states: BTreeMap<JobId, JobState> = states.into_iter().collect();
+        jobs.into_iter()
+            .filter(|j| j.server == server_id)
+            .filter_map(|j| {
+                j.dependencies().iter().find_map(|d| match states.get(&d.job_id) {
+                    None => Some((j.id.clone(), format!("dependency {} does not exist", d.job_id))),
+                    Some(JobState::Failed) | Some(JobState::Cancelled) => {
+                        Some((j.id.clone(), format!("dependency {} did not succeed", d.job_id)))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    };
+    for (id, reason) in blocked {
+        fail_job(app, &id, reason);
+    }
 }
 
 /// Drive one job through the synchronous contract:
@@ -208,6 +323,7 @@ async fn dispatch<S: Scheduler + ?Sized>(
     scheduler: &S,
     app: &Arc<App>,
     client: &ModelClient<'_>,
+    server_id: &str,
     job: &Job,
     cancellation: &Cancellation,
 ) {
@@ -231,7 +347,7 @@ async fn dispatch<S: Scheduler + ?Sized>(
     let _ = app.library.lock().unwrap().update_job(&working);
 
     // Wait for the server to report `ready`.
-    if !wait_for_ready::<S>(scheduler, app, client, &working, cancellation).await {
+    if !wait_for_ready::<S>(scheduler, app, client, server_id, &working, cancellation).await {
         return;
     }
 
@@ -260,6 +376,12 @@ async fn dispatch<S: Scheduler + ?Sized>(
             Ok(asset_ids) => {
                 let mut done = working;
                 done.outputs = asset_ids;
+                // Record the seed actually used (the server picks one if none was given).
+                done.seeds = Some(
+                    (0..result.outputs.len() as u64)
+                        .map(|i| (result.seed + i) % (1 << 32))
+                        .collect(),
+                );
                 if done.transition(JobState::Succeeded, asset_studio_core::time::now()).is_ok() {
                     let _ = app.library.lock().unwrap().update_job(&done);
                     tracing::info!(
@@ -291,12 +413,23 @@ async fn wait_for_ready<S: Scheduler + ?Sized>(
     scheduler: &S,
     app: &Arc<App>,
     client: &ModelClient<'_>,
+    server_id: &str,
     job: &Job,
     cancellation: &Cancellation,
 ) -> bool {
+    let started = std::time::Instant::now();
     loop {
         if cancellation.is_cancelled() {
             requeue(app, job, "cancelled while waiting for model".into());
+            return false;
+        }
+        if let Some(reason) = process_gone(app, server_id) {
+            // The session sees the exit next and restarts on demand; retry the job.
+            requeue(app, job, reason);
+            return false;
+        }
+        if started.elapsed() > load_timeout() {
+            fail_job(app, &job.id, format!("model did not become ready within {:?}", load_timeout()));
             return false;
         }
         match client.info(cancellation).await {
@@ -467,14 +600,15 @@ fn fail_job(app: &Arc<App>, id: &JobId, reason: String) {
     tracing::warn!(job = %id.0, "job failed: {reason}");
 }
 
-/// Mark all non-terminal jobs for `server_id` as `Failed` with a reason.
-fn fail_server_jobs(app: &Arc<App>, server_id: &str, reason: String) {
+/// Mark `server_id`'s in-flight jobs (waiting for the model, or running) as
+/// `Failed`; queued jobs stay queued and restart the server.
+fn fail_in_flight_jobs(app: &Arc<App>, server_id: &str, reason: String) {
     let jobs = {
         let lib = app.library.lock().unwrap();
         lib.list_jobs(None, 512).unwrap_or_default()
     };
     for mut job in jobs.into_iter().filter(|j| j.server == server_id) {
-        if job.state.is_terminal() {
+        if !matches!(job.state, JobState::WaitingModel | JobState::Running) {
             continue;
         }
         relax_to_state(&mut job, JobState::Failed);

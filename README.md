@@ -19,7 +19,8 @@ launcher and reached over HTTP. No PyO3, no model port.
 | `crates/launcher` | `asset-studio-launcher` | Model-server process management: spawn/poll/kill, per-server GPU slots. |
 | `crates/models` | `asset-studio-models` | Model catalog + typed `ModelClient` over `base-http-client`. |
 | `crates/server` | `asset-studio-server` | The REST API (`base-http-server` on `base-scheduler-native`) + the async job orchestrator. |
-| `crates/client` | `asset-studio-client` | The `asset-studio` CLI: `servers`, `list`, `import`, `generate`, `wait`, `download`. |
+| `crates/client` | `asset-studio-client` | The `asset-studio` CLI: `servers`, `list`, `import`, `generate`, `text-to-3d`, `wait`, `download`. |
+| `model_servers/` | `asset-studio-model-servers` | Python: our contract-v1 model servers (Z-Image text-to-image, TRELLIS.2 image-to-3D). |
 
 ## Build & test
 
@@ -52,6 +53,7 @@ cargo run -p asset-studio-client --bin asset-studio -- \
 - `DELETE /assets/{id}` — soft-delete
 - `GET /jobs[?state=]` / `GET /jobs/{id}`
 - `POST /jobs` — submit `{server, task, inputs, prompt, params, count, seeds, idempotency_key}`
+- `POST /pipelines/text-to-3d` — submit the prompt → picture → cut-out → GLB chain `{prompt, seed?, height_m?, image_params?, cutout_params?, model_params?}`
 - `POST /jobs/{id}/cancel` / `POST /jobs/{id}/retry`
 - `GET /health`
 
@@ -62,10 +64,18 @@ failure.
 
 ## Model servers
 
-The `models` crate declares a catalog of model servers. Each entry maps to a
-Python process (via `uv`) on a fixed port. To run a real model (e.g. the
-TRELLIS.2 paint vertical slice), you need the Python/CUDA environment (see the
-`justfile` / Nix flake in the reference repo) — that is independent of the Rust
-structure. The server currently starts catalog orchestrators at boot; use
-`--model-server trellis2` to start just TRELLIS.2 on a single GPU. See the
-[GPU setup and real paint smoke test](docs/trellis2.md) for reproducible commands.
+The `models` crate declares a catalog of model servers; each is a Python
+process on a fixed port, started **on demand** by the orchestrator when one of
+its jobs is ready and stopped when idle, so several GPU models take turns on
+one card. The catalog has a text-to-3D chain (Z-Image-Turbo → BiRefNet →
+TRELLIS.2) and TRELLIS.2 painting:
+
+```sh
+cargo run -p asset-studio-client --bin asset-studio -- \
+    text-to-3d "a small mossy boulder with ferns" --height 0.8 -o boulder.glb
+```
+
+`model_servers/` holds this repository's own servers (Z-Image, TRELLIS.2
+image-to-3D); the others come from the reference repository. Setup, licences
+and measured timings: [docs/model-servers.md](docs/model-servers.md).
+`--model-server <id>` (repeatable) limits which orchestrators run.

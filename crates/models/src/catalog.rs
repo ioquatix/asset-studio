@@ -30,6 +30,8 @@ pub struct ModelServer {
     pub port: u16,
     /// Whether it needs the GPU slot.
     pub uses_gpu: bool,
+    /// Free GPU memory (MiB) it needs to start; the orchestrator waits for it.
+    pub vram_mib: u64,
     /// Default program to run (e.g. `uv`).
     pub program: String,
     /// Default arguments (e.g. `run --no-sync <script>`).
@@ -97,13 +99,13 @@ fn port_env(port: u16) -> (String, String) {
 
 /// The model server's project directory under the asset-studio source root.
 ///
-/// The root is `ASSET_STUDIO_ROOT` (default `~/gym/assets_studio`), matching the
-/// checked-out reference repo. Returns `None` if the home dir is unknown (so a
+/// The root is `ASSET_STUDIO_ROOT` (default
+/// `~/Developer/kvladsrc/gym/assets_studio`), the checked-out reference repo. Returns `None` if the home dir is unknown (so a
 /// launch without an override degrades to the inherited cwd).
 fn server_dir(subdir: &str) -> Option<PathBuf> {
     let root = env::var("ASSET_STUDIO_ROOT").ok().map(PathBuf::from).or_else(|| {
         env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("gym").join("assets_studio"))
+            .map(|h| PathBuf::from(h).join("Developer/kvladsrc/gym/assets_studio"))
     })?;
     Some(root.join("model_servers").join(subdir))
 }
@@ -145,81 +147,117 @@ fn task(name: &str, description: &str, inputs: &[(&str, &str)], uses_prompt: boo
     }
 }
 
-/// The full catalog of known servers. Built on demand (cheap: ~4 entries).
+/// The asset-studio checkout (for `scripts/` and `model_servers/`): the
+/// compile-time location, unless `ASSET_STUDIO_HOME` says otherwise.
+fn studio_home() -> PathBuf {
+    env::var_os("ASSET_STUDIO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")))
+}
+
+/// A GPU model server launched by `scripts/model_server.sh` in the Nix CUDA
+/// shell: `project` is its uv project, `venv` its environment under
+/// `~/.cache/assets-studio/venvs/`, `script` its console script.
+#[allow(clippy::too_many_arguments)]
+fn gpu_server(
+    id: &str,
+    title: &str,
+    port: u16,
+    vram_mib: u64,
+    project: Option<PathBuf>,
+    venv: &str,
+    script: &str,
+    tasks: Vec<TaskInfo>,
+) -> ModelServer {
+    let launcher = studio_home().join("scripts/model_server.sh");
+    let project = project.unwrap_or_default();
+    ModelServer {
+        id: id.into(),
+        title: title.into(),
+        port,
+        uses_gpu: true,
+        vram_mib,
+        program: "/usr/bin/bash".into(),
+        args: vec![
+            launcher.to_string_lossy().into_owned(),
+            project.to_string_lossy().into_owned(),
+            venv.into(),
+            script.into(),
+        ],
+        cwd: None,
+        env: vec![("TORCH_CUDA_ARCH_LIST".into(), "8.9".into()), port_env(port)],
+        tasks,
+    }
+}
+
+/// The full catalog of known servers. Built on demand (cheap: a few entries).
+///
+/// `zimage` → `birefnet` → `trellis2_3d` is the text-to-3D chain: a prompt
+/// becomes a picture, the picture a cut-out, the cut-out a textured GLB.
+/// `trellis2` paints an existing mesh from a cut-out.
 pub fn all_servers() -> Vec<ModelServer> {
+    let own = Some(studio_home().join("model_servers"));
     vec![
-        ModelServer {
-            id: "trellis2".into(),
-            title: "TRELLIS.2 Paint".into(),
-            port: 8123,
-            uses_gpu: true,
-            program: "uv".into(),
-            args: vec!["run".into(), "--no-sync".into(), "trellis2-paint-model-server".into()],
-            cwd: server_dir("trellis2_paint"),
-            env: vec![("TORCH_CUDA_ARCH_LIST".into(), "8.9".into()), port_env(8123)],
-            tasks: vec![task(
+        gpu_server(
+            "zimage",
+            "Z-Image-Turbo",
+            8127,
+            14_000,
+            own.clone(),
+            "studio_servers",
+            "asset-studio-zimage-server",
+            vec![task(
+                "text-to-image",
+                "A picture from a prompt (params.object_reference frames one object for image-to-3D).",
+                &[],
+                true,
+            )],
+        ),
+        gpu_server(
+            "birefnet",
+            "BiRefNet",
+            8128,
+            3_000,
+            server_dir("birefnet"),
+            "birefnet",
+            "birefnet-model-server",
+            vec![task(
+                "image-to-image",
+                "Remove the background: the same picture as a cut-out RGBA PNG.",
+                &[("image", "image/png"), ("image", "image/jpeg"), ("image", "image/webp")],
+                false,
+            )],
+        ),
+        gpu_server(
+            "trellis2_3d",
+            "TRELLIS.2 Image to 3D",
+            8129,
+            16_000,
+            own,
+            "studio_servers",
+            "asset-studio-trellis2-server",
+            vec![task(
+                "image-to-3d",
+                "A textured PBR GLB from a cut-out picture (RGBA PNG).",
+                &[("image", "image/png")],
+                false,
+            )],
+        ),
+        gpu_server(
+            "trellis2",
+            "TRELLIS.2 Paint",
+            8123,
+            6_000,
+            server_dir("trellis2_paint"),
+            "trellis2_paint",
+            "trellis2-paint-model-server",
+            vec![task(
                 "3d-paint",
                 "Paint an existing mesh with a reference image, preserving surface and UVs.",
                 &[("mesh", "model/gltf-binary"), ("image", "image/png")],
                 false,
             )],
-        },
-        ModelServer {
-            id: "hunyuan3d".into(),
-            title: "Hunyuan3D 2.1".into(),
-            port: 8124,
-            uses_gpu: true,
-            program: "uv".into(),
-            args: vec!["run".into(), "--no-sync".into(), "hunyuan3d21-model-server".into()],
-            cwd: server_dir("hunyuan3d21"),
-            env: vec![("TORCH_CUDA_ARCH_LIST".into(), "8.9".into()), port_env(8124)],
-            tasks: vec![
-                task(
-                    "3d-shape",
-                    "Generate a 3D shape from an image.",
-                    &[("image", "image/png")],
-                    false,
-                ),
-                task(
-                    "3d-paint",
-                    "Paint a generated shape with PBR textures.",
-                    &[("mesh", "model/gltf-binary"), ("image", "image/png")],
-                    false,
-                ),
-            ],
-        },
-        ModelServer {
-            id: "hi3d".into(),
-            title: "Hi3D".into(),
-            port: 8125,
-            uses_gpu: true,
-            program: "uv".into(),
-            args: vec!["run".into(), "--no-sync".into(), "hi3d-model-server".into()],
-            cwd: server_dir("hi3d"),
-            env: vec![("TORCH_CUDA_ARCH_LIST".into(), "8.9".into()), port_env(8125)],
-            tasks: vec![task(
-                "3d-image",
-                "Generate a 3D mesh from an image.",
-                &[("image", "image/png")],
-                false,
-            )],
-        },
-        ModelServer {
-            id: "animation".into(),
-            title: "Animation Tools".into(),
-            port: 8126,
-            uses_gpu: true,
-            program: "uv".into(),
-            args: vec!["run".into(), "--no-sync".into(), "animation-tools-model-server".into()],
-            cwd: server_dir("animation_tools"),
-            env: vec![port_env(8126)],
-            tasks: vec![task(
-                "motion",
-                "Estimate a skeleton animation (SMPL-X / SOMA) from a video.",
-                &[("video", "video/mp4")],
-                false,
-            )],
-        },
+        ),
     ]
 }
 
@@ -244,20 +282,27 @@ mod tests {
     }
 
     #[test]
-    fn spec_uses_uv_and_pinned_port() {
-        let s = find_server("trellis2").unwrap();
-        assert_eq!(s.url(), "http://127.0.0.1:8123");
+    fn spec_launches_through_the_wrapper_with_a_pinned_port() {
+        let s = find_server("trellis2_3d").unwrap();
+        assert_eq!(s.url(), "http://127.0.0.1:8129");
         let spec = s.spec();
-        assert_eq!(spec.id, "trellis2");
+        assert_eq!(spec.id, "trellis2_3d");
         assert!(spec.uses_gpu);
-        assert_eq!(spec.program, "uv");
-        assert!(spec.args.starts_with(&["run".into(), "--no-sync".into()]));
+        assert_eq!(spec.program, "/usr/bin/bash");
+        assert!(spec.args[0].ends_with("scripts/model_server.sh"));
+        assert!(spec.args[1].ends_with("model_servers"));
+        assert_eq!(&spec.args[2..], ["studio_servers", "asset-studio-trellis2-server"]);
         // The launch pins the port the client will dial.
-        assert!(
-            spec.env.iter().any(|(k, v)| k == "MODEL_SERVER_PORT" && v == "8123")
-        );
-        // Info carries the tasks.
-        let info = s.info();
-        assert_eq!(info.tasks.len(), s.tasks.len());
+        assert!(spec.env.iter().any(|(k, v)| k == "MODEL_SERVER_PORT" && v == "8129"));
+        assert_eq!(s.info().tasks.len(), s.tasks.len());
+    }
+
+    #[test]
+    fn the_text_to_3d_chain_is_in_the_catalog() {
+        let ports: std::collections::BTreeSet<u16> = all_servers().iter().map(|s| s.port).collect();
+        assert_eq!(ports.len(), all_servers().len(), "ports are unique");
+        assert!(find_server("zimage").unwrap().task("text-to-image").unwrap().uses_prompt);
+        assert!(find_server("birefnet").unwrap().task("image-to-image").is_some());
+        assert!(find_server("trellis2_3d").unwrap().task("image-to-3d").is_some());
     }
 }

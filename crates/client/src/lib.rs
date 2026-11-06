@@ -181,6 +181,19 @@ impl<'scope> StudioClient<'scope> {
             .parsed()
     }
 
+    /// `POST /pipelines/text-to-3d` — submit the prompt → picture → cut-out →
+    /// GLB chain; returns `{jobs, model_job}`.
+    pub async fn text_to_3d(
+        &self,
+        payload: &serde_json::Value,
+        cancellation: &Cancellation,
+    ) -> Result<serde_json::Value, CallError> {
+        let body = serde_json::to_vec(payload)?;
+        self.request(Method::POST, "/pipelines/text-to-3d", Some(&body), cancellation)
+            .await?
+            .parsed()
+    }
+
     /// `POST /jobs/{id}/cancel` — cancel a job.
     pub async fn cancel(
         &self,
