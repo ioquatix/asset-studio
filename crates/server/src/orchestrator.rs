@@ -343,9 +343,10 @@ async fn dispatch<S: Scheduler + ?Sized>(
     };
 
     let mut working = job.clone();
-    if working
-        .transition(JobState::WaitingModel, asset_studio_core::time::now())
-        .is_err()
+    if finished_elsewhere(app, &job.id)
+        || working
+            .transition(JobState::WaitingModel, asset_studio_core::time::now())
+            .is_err()
     {
         return;
     }
@@ -356,6 +357,10 @@ async fn dispatch<S: Scheduler + ?Sized>(
         return;
     }
 
+    if finished_elsewhere(app, &job.id) {
+        tracing::info!(job = %job.id.0, "job cancelled while waiting for the model");
+        return;
+    }
     if working.transition(JobState::Running, asset_studio_core::time::now()).is_err() {
         return;
     }
@@ -369,13 +374,17 @@ async fn dispatch<S: Scheduler + ?Sized>(
             &working.task,
             working.prompt.as_deref(),
             &inputs,
-            &working.params,
+            &model_params(&working.params),
             working.count as u64,
             seed,
             cancellation,
         )
         .await;
 
+    if finished_elsewhere(app, &job.id) {
+        tracing::info!(job = %job.id.0, "job cancelled while generating; outputs discarded");
+        return;
+    }
     match result {
         Ok(result) => match store_outputs(app, &working, &result) {
             Ok(asset_ids) => {
@@ -586,10 +595,16 @@ fn asset_kind_for_mime(mime: &str) -> AssetKind {
 /// Re-queue a job with one retry recorded in `params["retries"]` (and the
 /// last reason in `params["last_error"]`); once the ceiling is hit, fail it.
 fn requeue(app: &Arc<App>, job: &Job, reason: String) {
-    let mut working = job.clone();
+    // Re-read: the job may have been cancelled while it was in flight.
+    let Some(mut working) = app.library.lock().unwrap().get_job(&job.id).ok().flatten() else {
+        return;
+    };
+    if working.state.is_terminal() {
+        return;
+    }
     let retries: u32 = working
         .params
-        .get("retries")
+        .get(RETRIES_KEY)
         .and_then(|r| r.as_u64())
         .unwrap_or(0) as u32;
     if retries + 1 > MAX_RETRIES {
@@ -597,12 +612,42 @@ fn requeue(app: &Arc<App>, job: &Job, reason: String) {
         return;
     }
     relax_to_state(&mut working, JobState::Queued);
+    if !working.params.is_object() {
+        working.params = serde_json::json!({});
+    }
     if let Some(m) = working.params.as_object_mut() {
-        m.insert("retries".into(), (retries + 1).into());
-        m.insert("last_error".into(), reason.clone().into());
+        m.insert(RETRIES_KEY.into(), (retries + 1).into());
+        m.insert(LAST_ERROR_KEY.into(), reason.clone().into());
     }
     let _ = app.library.lock().unwrap().update_job(&working);
     tracing::warn!(job = %job.id.0, retries = retries + 1, "job re-queued: {reason}");
+}
+
+/// The studio's own bookkeeping in a job's `params`: keys starting with `_`,
+/// never sent to the model server (which would reject unknown parameters).
+const RETRIES_KEY: &str = "_retries";
+const LAST_ERROR_KEY: &str = "_last_error";
+
+/// A job's params as the model server should see them: without the studio's
+/// `_`-prefixed bookkeeping keys.
+fn model_params(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Whether the job was cancelled (or otherwise finished) since it was picked.
+fn finished_elsewhere(app: &Arc<App>, id: &JobId) -> bool {
+    match app.library.lock().unwrap().get_job(id) {
+        Ok(Some(job)) => job.state.is_terminal(),
+        _ => true,
+    }
 }
 
 /// Move a non-terminal job to `next`, bypassing the strict state machine when
@@ -705,6 +750,13 @@ mod tests {
             updated_at: 0,
             retry_of: None,
         }
+    }
+
+    #[test]
+    fn bookkeeping_keys_are_not_sent_to_the_model() {
+        let params = serde_json::json!({"steps": 12, "_retries": 2, "_last_error": "x"});
+        assert_eq!(model_params(&params), serde_json::json!({"steps": 12}));
+        assert_eq!(model_params(&serde_json::Value::Null), serde_json::Value::Null);
     }
 
     #[test]

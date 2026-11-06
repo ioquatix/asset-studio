@@ -41,10 +41,12 @@ MODEL_NAMES = (
     "shape_slat_flow_model_512",
     "shape_slat_flow_model_1024",
     "shape_slat_decoder",
-    "tex_slat_flow_model_512",
     "tex_slat_flow_model_1024",
     "tex_slat_decoder",
 )
+# Only the "512" resolution uses it: loaded on first use, to keep ~2.6 GB of
+# host memory free for the cascades (the process holds every model in RAM).
+LAZY_512 = "tex_slat_flow_model_512"
 
 
 def _path(variable: str, default: str) -> Path:
@@ -93,6 +95,13 @@ def download() -> None:
         allow_patterns=["config.json", "model.safetensors"],
         local_dir=root / "dino",
     )
+
+
+def low_vram() -> bool:
+    """``TRELLIS2_LOW_VRAM`` (default on): keep the models in host RAM and move each to the GPU
+    only for its phase (~3-12 GiB VRAM, but ~16-31 GiB host RAM at peak). Off: keep them on the
+    GPU (~14 GiB of weights plus activations; needs a 24 GB card, little host RAM)."""
+    return os.environ.get("TRELLIS2_LOW_VRAM", "1").lower() not in {"0", "false", "no", "off"}
 
 
 class Params(BaseModel):
@@ -159,7 +168,7 @@ class Trellis2Server(ModelServer):
         "revision": WEIGHTS_REVISION[:12],
         "license": "MIT",
         "source": "https://github.com/microsoft/TRELLIS.2",
-        "details": {"offloading": "each flow model moves to the GPU for its own phase"},
+        "details": {"offloading": "TRELLIS2_LOW_VRAM: models in host RAM, each on the GPU for its phase (default), or all on the GPU"},
     }
     tasks = (TASK,)
 
@@ -186,7 +195,7 @@ class Trellis2Server(ModelServer):
             tex_slat_normalization=args["tex_slat_normalization"],
             image_cond_model=DinoV3FeatureExtractor(str(root / "dino")),
             rembg_model=None,
-            low_vram=True,
+            low_vram=low_vram(),
             default_pipeline_type=args.get("default_pipeline_type", "1024_cascade"),
         )
         for key in ("sparse_structure", "shape_slat", "tex_slat"):
@@ -195,6 +204,7 @@ class Trellis2Server(ModelServer):
             setattr(pipeline, f"{key}_sampler_params", spec["params"])
         pipeline.cuda()
         self.pipeline = pipeline
+        self.root, self.args, self.models = root, args, models
 
     def generate(self, job: Job) -> list[Output]:
         assert isinstance(job.params, Params)
@@ -206,6 +216,10 @@ class Trellis2Server(ModelServer):
         import torch
 
         steps = {"steps": params.steps}
+        if params.resolution == "512" and LAZY_512 not in self.pipeline.models:
+            model = self.models.from_pretrained(str(self.root / "weights" / self.args["models"][LAZY_512]))
+            model.eval()
+            self.pipeline.models[LAZY_512] = model
         torch.cuda.reset_peak_memory_stats()
         try:
             mesh = self.pipeline.run(

@@ -190,6 +190,12 @@ fn gpu_server(
     }
 }
 
+/// `server` with one more environment variable for its process.
+fn with_env(mut server: ModelServer, key: &str, value: &str) -> ModelServer {
+    server.env.push((key.into(), value.into()));
+    server
+}
+
 /// The full catalog of known servers. Built on demand (cheap: a few entries).
 ///
 /// `zimage` → `birefnet` → `trellis2_3d` is the text-to-3D chain: a prompt
@@ -228,11 +234,17 @@ pub fn all_servers() -> Vec<ModelServer> {
                 false,
             )],
         ),
-        gpu_server(
+        with_env(gpu_server(
             "trellis2_3d",
             "TRELLIS.2 Image to 3D",
             8129,
-            16_000,
+            // All models stay on the GPU (TRELLIS2_LOW_VRAM=0): ~15 GiB of
+            // weights plus activations on a 24 GB card, and only a few GB of
+            // host RAM. Low-VRAM mode needs 16-31 GB of host RAM instead,
+            // which was killed by the kernel's OOM killer on a 46 GB machine
+            // with a full /tmp; set ASSET_STUDIO_TRELLIS2_3D_LOW_VRAM=1 for
+            // cards under 24 GB.
+            20_000,
             own,
             "studio_servers",
             "asset-studio-trellis2-server",
@@ -242,7 +254,7 @@ pub fn all_servers() -> Vec<ModelServer> {
                 &[("image", "image/png")],
                 false,
             )],
-        ),
+        ), "TRELLIS2_LOW_VRAM", &env::var("ASSET_STUDIO_TRELLIS2_3D_LOW_VRAM").unwrap_or_else(|_| "0".into())),
         gpu_server(
             "trellis2",
             "TRELLIS.2 Paint",

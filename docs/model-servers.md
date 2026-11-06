@@ -26,6 +26,13 @@ licence (NVIDIA Source Code License) does not permit commercial use. Treat
 `trellis2_3d` and `trellis2` outputs as non-commercial until that dependency is
 replaced (Effigy replaced it with a pure-torch UV rasterizer).
 
+**Memory:** `trellis2_3d` keeps all its models on the GPU by default
+(`TRELLIS2_LOW_VRAM=0`, ~15 GiB resident, ~27 s per model at `1024_cascade`).
+Its low-VRAM mode (`ASSET_STUDIO_TRELLIS2_3D_LOW_VRAM=1`, for cards under
+24 GB) moves each model to the GPU only for its phase but needs 16-31 GiB of
+*host* RAM; on a 46 GB machine with other work and a large tmpfs `/tmp`, the
+kernel's OOM killer stopped it (exit 137). `1536_cascade` needs even more.
+
 ## Setup (RTX 4090, Linux)
 
 Prerequisites: Nix, and the reference repository
