@@ -109,6 +109,9 @@ pub enum ServerHandlerError {
 pub struct App {
     pub library: Arc<Mutex<Library>>,
     pub launcher: Arc<Launcher>,
+    /// Why a server with ready work has not started (GPU busy, not enough
+    /// GPU memory), by server id; set by the orchestrator, shown on queued jobs.
+    pub waiting: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl App {
@@ -116,7 +119,19 @@ impl App {
         Self {
             library: Arc::new(Mutex::new(library)),
             launcher: Arc::new(launcher),
+            waiting: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// A job as JSON, with `waiting` (why it has not started) while it is queued.
+    pub fn job_json(&self, job: &asset_studio_core::Job) -> serde_json::Value {
+        let mut value = serde_json::to_value(job).unwrap_or(serde_json::Value::Null);
+        if job.state == JobState::Queued {
+            if let Some(reason) = self.waiting.lock().unwrap().get(&job.server) {
+                value["waiting"] = reason.clone().into();
+            }
+        }
+        value
     }
 }
 
@@ -292,7 +307,7 @@ impl Studio {
                 Ok(Self::json(
                     Status::OK,
                     serde_json::json!({
-                        "jobs": jobs.iter().map(|j| serde_json::to_value(j).unwrap()).collect::<Vec<_>>(),
+                        "jobs": jobs.iter().map(|j| self.app.job_json(j)).collect::<Vec<_>>(),
                     }),
                 ))
             }
@@ -306,7 +321,7 @@ impl Studio {
                     .unwrap()
                     .get_job(&asset_studio_core::JobId(id.to_string()))?
                     .ok_or(asset_studio_core::Error::UnknownAsset(id.to_string()))?;
-                Ok(Self::json(Status::OK, serde_json::json!({ "job": job })))
+                Ok(Self::json(Status::OK, serde_json::json!({ "job": self.app.job_json(&job) })))
             }
             ("POST", ["jobs", id, "cancel"]) => cancel_job(&self.app.library, id),
             ("POST", ["jobs", id, "retry"]) => retry_job(&self.app.library, id),

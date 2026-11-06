@@ -148,7 +148,7 @@ def _summary(asset: dict[str, Any]) -> dict[str, Any]:
 
 
 def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
-    keys = ("id", "server", "task", "state", "prompt", "params", "seeds", "outputs", "error")
+    keys = ("id", "server", "task", "state", "prompt", "params", "seeds", "outputs", "error", "waiting")
     summary = {k: job.get(k) for k in keys}
     summary["inputs"] = {
         role: (ref.get("Asset", {}).get("id") if "Asset" in ref else ref.get("JobOutput"))
@@ -179,6 +179,8 @@ async def _wait(job_ids: list[str], wait_s: float, ctx: Context | None, own: boo
             done = sum(j["state"] == "succeeded" for j in jobs)
             current = next((j for j in jobs if j["state"] != "succeeded"), last)
             message = f"{current['server']} {current['task']}: {current['state']}"
+            if current.get("waiting"):
+                message += f" ({current['waiting']})"
             # On a change, else every 10 s as a keep-alive.
             if ctx is not None and (message != reported or loop.time() - reported_at >= 10):
                 reported, reported_at = message, loop.time()
@@ -210,6 +212,10 @@ def _result(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         result["next"] = "look at the output_assets, or export_asset / open_in_blender"
     elif status == "running":
         result["next"] = f"call job_status with job_id {last['id']} (wait_s up to 45)"
+        blocked = next((j for j in jobs if j.get("waiting")), None)
+        if blocked is not None:
+            result["waiting"] = (f"{blocked['server']} has not started: {blocked['waiting']}. "
+                                 "It starts by itself once the GPU is free; tell the user.")
     else:
         result["error"] = failed.get("error")
     return result

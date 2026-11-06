@@ -117,6 +117,7 @@ pub async fn run<S: Scheduler>(
         fail_blocked_jobs(app, server_id);
         if pick_ready_job(app, server_id).is_none() {
             waiting_for = None;
+            app.waiting.lock().unwrap().remove(server_id);
             let _ = scheduler.sleep(TICK, cancellation).await;
             continue;
         }
@@ -124,11 +125,13 @@ pub async fn run<S: Scheduler>(
         match start(app, &server) {
             Ok(pid) => {
                 waiting_for = None;
+                app.waiting.lock().unwrap().remove(server_id);
                 tracing::info!(server = server_id, pid, "model server started");
             }
             Err(Start::Wait(reason)) => {
                 if waiting_for.as_deref() != Some(reason.as_str()) {
                     tracing::info!(server = server_id, "job waiting: {reason}");
+                    app.waiting.lock().unwrap().insert(server_id.to_string(), reason.clone());
                     waiting_for = Some(reason);
                 }
                 let _ = scheduler.sleep(TICK, cancellation).await;

@@ -45,6 +45,11 @@ The resource `asset-studio://guide` lists every task's parameters.
   every 10 s), then return `status: running` and a job id for `job_status`.
   If the agent cancels a call that started jobs, those jobs are cancelled.
   `job_status` on the last job of a chain reports every stage.
+- **Waiting for the GPU**: while a ready job cannot start (another model, or
+  another program such as Ollama, holds the GPU or its memory), the job has a
+  `waiting` field with the reason, and the tools pass it on. An agent served
+  by a *local* LLM on the same GPU will often see this: unload the LLM (e.g.
+  `ollama stop <model>`) or use a smaller one while generating.
 - **Nothing is deleted or overwritten**: generations and Blender edits are new
   assets; `export_asset` refuses an existing file. Only `cancel_job` and
   `close_in_blender` are marked destructive.
