@@ -201,7 +201,9 @@ fn start(app: &Arc<App>, server: &asset_studio_models::ModelServer) -> Result<u3
     }
     match launcher.spawn(&server.spec()) {
         Ok(pid) => Ok(pid),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Start::Wait(e.to_string())),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Interrupted) => {
+            Err(Start::Wait(e.to_string()))
+        }
         Err(e) => Err(Start::Failed(e.to_string())),
     }
 }
@@ -507,13 +509,19 @@ fn store_outputs(
     let now = asset_studio_core::time::now();
     let mut ids = Vec::new();
     let lib = app.library.lock().unwrap();
+    let base = title_base(&lib, job);
+    let many = result.outputs.len() > 1;
     for (i, out) in result.outputs.iter().enumerate() {
         let id = AssetId(uuid::Uuid::new_v4().to_string());
         let asset = Asset {
             id: id.clone(),
             kind: asset_kind_for_mime(&out.mime),
             mime: out.mime.clone(),
-            title: Some(format!("{} #{} (job {})", job.task, i + 1, job.id.0)),
+            title: Some(if many {
+                format!("{base} · {} #{}", job.task, i + 1)
+            } else {
+                format!("{base} · {}", job.task)
+            }),
             size_bytes: out.data.len() as u64,
             blob_sha256: String::new(), // filled in by upsert
             rating: None,
@@ -526,6 +534,31 @@ fn store_outputs(
         ids.push(stored.id);
     }
     Ok(ids)
+}
+
+/// What a job's outputs are about: its prompt, else the base title of its
+/// first input (the part before " · ", so a chain keeps the original name),
+/// else the task. At most 80 characters.
+fn title_base(lib: &Library, job: &Job) -> String {
+    let from_input = || {
+        let input = job.inputs.values().next()?;
+        let asset = resolve_input(lib, input).ok()??;
+        let title = asset.title?;
+        Some(title.split(" · ").next().unwrap_or(&title).to_string())
+    };
+    let base = job
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .or_else(from_input)
+        .unwrap_or_else(|| job.task.clone());
+    if base.chars().count() > 80 {
+        format!("{}…", base.chars().take(79).collect::<String>())
+    } else {
+        base
+    }
 }
 
 /// Map an output MIME type to the closest [`AssetKind`].
@@ -637,4 +670,62 @@ where
         Poll::Pending
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asset_studio_core::AssetRef;
+
+    fn job(prompt: Option<&str>, input: Option<&AssetId>) -> Job {
+        let mut inputs = BTreeMap::new();
+        if let Some(id) = input {
+            inputs.insert(
+                "image".to_string(),
+                InputRef::Asset(AssetRef { id: id.clone(), role: "image".into() }),
+            );
+        }
+        Job {
+            id: JobId::from("j"),
+            server: "birefnet".into(),
+            task: "image-to-image".into(),
+            state: JobState::Queued,
+            prompt: prompt.map(String::from),
+            params: serde_json::Value::Null,
+            inputs,
+            count: 1,
+            seeds: None,
+            idempotency_key: None,
+            outputs: vec![],
+            error: None,
+            created_at: 0,
+            updated_at: 0,
+            retry_of: None,
+        }
+    }
+
+    #[test]
+    fn output_titles_follow_the_prompt_through_a_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path()).unwrap();
+        let picture = Asset {
+            id: AssetId::from("a1"),
+            kind: AssetKind::Image,
+            mime: "image/png".into(),
+            title: Some("a small mossy boulder · text-to-image".into()),
+            size_bytes: 3,
+            blob_sha256: String::new(),
+            rating: None,
+            tags: vec![],
+            producer: None,
+            created_at: 0,
+            deleted_at: None,
+        };
+        let stored = lib.upsert_asset(&picture, b"png").unwrap();
+        assert_eq!(title_base(&lib, &job(None, Some(&stored.id))), "a small mossy boulder");
+        assert_eq!(title_base(&lib, &job(Some("  a red mushroom "), None)), "a red mushroom");
+        assert_eq!(title_base(&lib, &job(None, None)), "image-to-image");
+        let long = "x".repeat(200);
+        assert_eq!(title_base(&lib, &job(Some(&long), None)).chars().count(), 80);
+    }
 }

@@ -1,0 +1,1 @@
+"""asset-studio MCP server."""

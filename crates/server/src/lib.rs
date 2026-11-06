@@ -245,7 +245,20 @@ impl Studio {
             ("POST", ["assets", "import"]) => {
                 let kind = opt_query(query, "kind").unwrap_or_else(|| "image".to_string());
                 let title = opt_query(query, "title");
-                import_asset(&self.app.library, &kind, &title, raw_body.to_vec())
+                let mut tags: Vec<String> = opt_query(query, "tags")
+                    .map(|t| t.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect())
+                    .unwrap_or_default();
+                if let Some(source) = opt_query(query, "derived_from") {
+                    // The source must exist: an agent's edit names what it edited.
+                    self.app
+                        .library
+                        .lock()
+                        .unwrap()
+                        .get_asset(&asset_studio_core::AssetId(source.clone()))?
+                        .ok_or(asset_studio_core::Error::UnknownAsset(source.clone()))?;
+                    tags.push(format!("derived:{source}"));
+                }
+                import_asset(&self.app.library, &kind, &title, tags, raw_body.to_vec())
             }
             ("PUT", ["assets", id, "rating"]) => {
                 let rating: Option<u8> = serde_json::from_slice(raw_body)
@@ -347,14 +360,23 @@ fn import_asset(
     library: &Arc<Mutex<Library>>,
     kind: &str,
     title: &Option<String>,
+    tags: Vec<String>,
     bytes: Vec<u8>,
 ) -> Result<Response<BufferedBody<Vec<u8>>>, ApiError> {
     let kind: asset_studio_core::AssetKind = kind.parse()?;
-    let mime = kind
-        .accepted_mime()
-        .first()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let accepted = kind.accepted_mime();
+    let mime = match sniff_mime(&bytes) {
+        Some(mime) if accepted.contains(&mime) => mime.to_string(),
+        _ if accepted.contains(&"application/octet-stream") => "application/octet-stream".to_string(),
+        sniffed => {
+            return Err(ApiError::BadRequest(format!(
+                "a {} asset must be one of {} (the file looks like {})",
+                kind.as_str(),
+                accepted.join(", "),
+                sniffed.unwrap_or("unknown data")
+            )))
+        }
+    };
     let asset = asset_studio_core::Asset {
         id: new_asset_id(),
         kind,
@@ -363,11 +385,12 @@ fn import_asset(
         size_bytes: bytes.len() as u64,
         blob_sha256: String::new(),
         rating: None,
-        tags: vec![],
+        tags,
         producer: None,
         created_at: asset_studio_core::time::now(),
         deleted_at: None,
     };
+    asset.validate_tags()?;
     let stored = library.lock().unwrap().upsert_asset(&asset, &bytes)?;
     Ok(Studio::json(
         Status::CREATED,
@@ -587,12 +610,47 @@ async fn body_to_bytes<B: ReadableBody>(mut body: B, cancellation: &Cancellation
     out
 }
 
-/// Extract an optional query parameter from a query string.
+/// Extract an optional query parameter from a query string, percent-decoded
+/// (`+` is a space, as in form encoding).
 fn opt_query(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| v.to_string())
+        (percent_decode(k) == key).then(|| percent_decode(v))
     })
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() && text.is_char_boundary(i + 3) => {
+                match u8::from_str_radix(&text[i + 1..i + 3], 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            byte => out.push(byte),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The MIME type of a file, from its leading bytes.
+fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        [b'g', b'l', b'T', b'F', ..] => Some("model/gltf-binary"),
+        _ => None,
+    }
 }
 
 fn job_id() -> asset_studio_core::JobId {
@@ -613,6 +671,22 @@ mod tests {
         assert_eq!(opt_query("state=queued&limit=5", "limit"), Some("5".into()));
         assert_eq!(opt_query("state=queued", "missing"), None);
         assert_eq!(opt_query("", "state"), None);
+        assert_eq!(
+            opt_query("title=Cute+anime+snail+%E2%80%94+v2&x=1", "title"),
+            Some("Cute anime snail — v2".into())
+        );
+        assert_eq!(opt_query("t=100%25", "t"), Some("100%".into()));
+        assert_eq!(opt_query("t=bad%2", "t"), Some("bad%2".into()));
+        assert_eq!(opt_query("t=bad%zz", "t"), Some("bad%zz".into()));
+    }
+
+    #[test]
+    fn sniffs_image_and_model_types() {
+        assert_eq!(sniff_mime(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
+        assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_mime(b"glTF\x02\0\0\0"), Some("model/gltf-binary"));
+        assert_eq!(sniff_mime(b"hello"), None);
     }
 
     #[test]

@@ -1,0 +1,28 @@
+[project]
+name = "asset-studio-mcp"
+version = "0.1.0"
+description = "MCP server for asset-studio: the library, generation jobs and a Blender bridge, for agents."
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.3.0",
+  "httpx>=0.27",
+  "Pillow>=10.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3"]
+
+[project.scripts]
+asset-studio-mcp = "asset_studio_mcp.server:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/asset_studio_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Run inside Blender (GPL-3.0-or-later), never imported by the MCP server.
+"blender_ops" = "asset_studio_mcp/blender_ops"

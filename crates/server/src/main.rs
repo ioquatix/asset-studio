@@ -66,6 +66,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let launcher = Launcher::new();
     let app = Arc::new(App::new(library, launcher));
 
+    // On Ctrl-C / SIGTERM / SIGHUP, stop the model servers before exiting:
+    // they are separate processes holding the GPU, and `Drop` does not run
+    // when a signal ends the process.
+    {
+        let launcher = Arc::clone(&app.launcher);
+        ctrlc::set_handler(move || {
+            eprintln!("asset-studio-server: stopping model servers");
+            launcher.shutdown();
+            std::process::exit(130);
+        })?;
+    }
+
     let scheduler = Arc::new(NativeScheduler::with_options(NativeOptions {
         workers: cli.workers,
         threads: cli.workers,

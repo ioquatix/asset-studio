@@ -20,6 +20,7 @@ launcher and reached over HTTP. No PyO3, no model port.
 | `crates/models` | `asset-studio-models` | Model catalog + typed `ModelClient` over `base-http-client`. |
 | `crates/server` | `asset-studio-server` | The REST API (`base-http-server` on `base-scheduler-native`) + the async job orchestrator. |
 | `crates/client` | `asset-studio-client` | The `asset-studio` CLI: `servers`, `list`, `import`, `generate`, `text-to-3d`, `wait`, `download`. |
+| `mcp_server/` | `asset-studio-mcp` | Python: the MCP server for agents (library, jobs, `look`, Blender bridge); see [docs/mcp.md](docs/mcp.md). |
 | `model_servers/` | `asset-studio-model-servers` | Python: our contract-v1 model servers (Z-Image text-to-image, TRELLIS.2 image-to-3D). |
 
 ## Build & test
@@ -48,7 +49,7 @@ cargo run -p asset-studio-client --bin asset-studio -- \
 - `GET /` — service root (server list, status)
 - `GET /servers` — model servers + tasks
 - `GET /assets[?kind=]` / `GET /assets/{id}` / `GET /assets/{id}/download`
-- `POST /assets/import?kind=image|mesh&title=…` (raw body)
+- `POST /assets/import?kind=image|mesh&title=…&tags=a,b&derived_from=<id>` (raw body; the MIME type is detected from the bytes)
 - `PUT /assets/{id}/rating` — set a 0–5 rating
 - `DELETE /assets/{id}` — soft-delete
 - `GET /jobs[?state=]` / `GET /jobs/{id}`
@@ -79,3 +80,10 @@ cargo run -p asset-studio-client --bin asset-studio -- \
 image-to-3D); the others come from the reference repository. Setup, licences
 and measured timings: [docs/model-servers.md](docs/model-servers.md).
 `--model-server <id>` (repeatable) limits which orchestrators run.
+
+## Agents (MCP)
+
+`scripts/setup_mcp.sh` builds the MCP server; register
+`~/.cache/assets-studio/venvs/mcp/bin/asset-studio-mcp` with your agent. It
+can generate models from text, look at assets (rendered sheets), run any
+task, and move models to and from a live Blender. See [docs/mcp.md](docs/mcp.md).

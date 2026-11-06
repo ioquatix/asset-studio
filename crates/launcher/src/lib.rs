@@ -69,6 +69,8 @@ struct LauncherState {
     servers: HashMap<String, ServerHandle>,
     /// The ids of servers currently holding the GPU slot (capacity 1).
     gpu_holders: HashSet<String>,
+    /// Set by [`Launcher::shutdown`]: no more servers start.
+    closed: bool,
 }
 
 impl Default for Launcher {
@@ -83,6 +85,7 @@ impl Launcher {
             state: Mutex::new(LauncherState {
                 servers: HashMap::new(),
                 gpu_holders: HashSet::new(),
+                closed: false,
             }),
         }
     }
@@ -107,6 +110,9 @@ impl Launcher {
     /// platform process id.
     pub fn spawn(&self, spec: &ServerSpec) -> io::Result<u32> {
         let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "the launcher is shutting down"));
+        }
         if spec.uses_gpu && !state.gpu_holders.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -212,6 +218,13 @@ impl Launcher {
             state.gpu_holders.remove(id);
         }
         Ok(Some(status.code().unwrap_or(-1)))
+    }
+
+    /// Refuse new servers from now on, then stop every tracked one (for a
+    /// signal handler: the process is about to exit, and `Drop` won't run).
+    pub fn shutdown(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.stop_all();
     }
 
     /// Stop every tracked server.
@@ -353,6 +366,16 @@ mod tests {
         assert!(tree.len() > 1, "the grandchild started");
         l.kill("tree").unwrap();
         assert!(tree.iter().all(|pid| !alive(*pid)), "no process of the tree survives");
+    }
+
+    #[test]
+    fn shutdown_stops_servers_and_refuses_new_ones() {
+        let l = Launcher::new();
+        l.spawn(&spec("g1", true, "sleep", &["30"])).unwrap();
+        l.shutdown();
+        assert!(l.server_ids().is_empty() && l.gpu_is_free());
+        let error = l.spawn(&spec("g2", true, "sleep", &["30"])).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[test]
