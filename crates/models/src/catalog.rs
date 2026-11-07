@@ -212,12 +212,20 @@ pub fn all_servers() -> Vec<ModelServer> {
             own.clone(),
             "studio_servers",
             "asset-studio-zimage-server",
-            vec![task(
-                "text-to-image",
-                "A picture from a prompt (params.object_reference frames one object for image-to-3D).",
-                &[],
-                true,
-            )],
+            vec![
+                task(
+                    "text-to-image",
+                    "A picture from a prompt (params.object_reference frames one object for image-to-3D).",
+                    &[],
+                    true,
+                ),
+                task(
+                    "image-to-image",
+                    "Redraw a picture following a prompt (params.strength: how far from the input).",
+                    &[("image", "image/png"), ("image", "image/jpeg"), ("image", "image/webp")],
+                    true,
+                ),
+            ],
         ),
         gpu_server(
             "birefnet",

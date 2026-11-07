@@ -12,10 +12,15 @@ hands the one GPU from model to model. If another program holds the memory
 
 | Server id | Task | Model (licence) | Code | Port |
 |---|---|---|---|---|
-| `zimage` | `text-to-image` | Z-Image-Turbo (Apache-2.0) | `model_servers/` (this repo, MIT) | 8127 |
+| `zimage` | `text-to-image`, `image-to-image` (redraw) | Z-Image-Turbo (Apache-2.0) | `model_servers/` (this repo, MIT) | 8127 |
 | `birefnet` | `image-to-image` (cut-out) | BiRefNet dynamic (MIT) | reference repo (GPL-3.0) | 8128 |
 | `trellis2_3d` | `image-to-3d` | TRELLIS.2-4B (MIT) | `model_servers/` (this repo, MIT) | 8129 |
 | `trellis2` | `3d-paint` | TRELLIS.2-4B texturing (MIT) | reference repo (GPL-3.0) | 8123 |
+
+`zimage`'s `image-to-image` redraws an input picture following the prompt; `params.strength` (default
+0.45) sets how far it may move from the input: about 0.3 keeps the layout to within a pixel or two, 0.45
+restyles while keeping features within about a millimetre on a face texture. It shares the text-to-image
+weights, so it costs no extra memory. An input with alpha keeps its cut-out.
 
 Our own servers implement the contract in `model_servers/src/asset_studio_servers/contract.py`
 rather than importing the reference SDK, which is GPL. The reference servers

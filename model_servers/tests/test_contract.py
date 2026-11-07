@@ -139,3 +139,11 @@ def test_trellis2_places_mesh_on_the_ground():
     assert np.allclose(bounds["extents_m"], [1.0, 2.0, 0.5])
     assert np.isclose(bounds["bounds_min"][1], 0.0)
     assert np.allclose([bounds["bounds_min"][0], bounds["bounds_min"][2]], [-0.5, -0.25])
+
+
+def test_zimage_redraw_keeps_aspect_in_multiples_of_16():
+    assert zimage.redraw_size(1000, 500, 1024) == (1024, 512)
+    assert zimage.redraw_size(333, 777, 1024) == (432, 1024)
+    assert zimage.REDRAW.task == "image-to-image" and zimage.REDRAW.inputs[0].role == "image"
+    with pytest.raises(ValueError):
+        zimage.RedrawParams(size=1000)

@@ -21,7 +21,7 @@ launcher and reached over HTTP. No PyO3, no model port.
 | `crates/server` | `asset-studio-server` | The REST API (`base-http-server` on `base-scheduler-native`) + the async job orchestrator. |
 | `crates/client` | `asset-studio-client` | The `asset-studio` CLI: `servers`, `list`, `import`, `generate`, `text-to-3d`, `wait`, `download`. |
 | `mcp_server/` | `asset-studio-mcp` | Python: the MCP server for agents (library, jobs, `look`, Blender bridge); see [docs/mcp.md](docs/mcp.md). |
-| `model_servers/` | `asset-studio-model-servers` | Python: our contract-v1 model servers (Z-Image text-to-image, TRELLIS.2 image-to-3D). |
+| `model_servers/` | `asset-studio-model-servers` | Python: our contract-v1 model servers (Z-Image text-to-image and redraw, TRELLIS.2 image-to-3D). |
 
 ## Build & test
 
